@@ -8,7 +8,7 @@
 //    https://developers.cloudflare.com/1.1.1.1/dns-over-https/json-format/.
 //  - DNS Queries over HTTPS (DoH), as specified in:
 //    https://tools.ietf.org/html/draft-ietf-doh-dns-over-https-12.
-package httpserver
+package lambda
 
 import (
 	"encoding/base64"
@@ -16,102 +16,95 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/apex/gateway"
 	"github.com/prjctgeek/dnss/internal/dnsjson"
-	"github.com/prjctgeek/dnss/internal/util"
-
-	"github.com/prjctgeek/log"
 
 	"github.com/miekg/dns"
-	"golang.org/x/net/trace"
 )
 
-// Server is an HTTPS server that implements DNS over HTTPS, see the
-// package-level documentation for more references.
 type Server struct {
 	Addr     string
 	Upstream string
-	CertFile string
-	KeyFile  string
 }
 
-// InsecureForTesting = true will make Server.ListenAndServe will not use TLS.
-// This is only useful for integration testing purposes.
-var InsecureForTesting = false
+func timeTrack(start time.Time, name string) {
+	elapsed := time.Since(start)
+	log.Printf("%s took %s", name, elapsed)
+}
 
-// ListenAndServe starts the HTTPS server.
 func (s *Server) ListenAndServe() {
-	mux := http.NewServeMux()
+	/* mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.Resolve)
 	mux.HandleFunc("/resolve", s.Resolve)
-	srv := http.Server{
-		Addr:    s.Addr,
-		Handler: mux,
-	}
+	*/
+	http.HandleFunc("/dns-query", s.Resolve)
+	http.HandleFunc("/resolve", s.Resolve)
+	http.HandleFunc("/ping", s.Ping)
 
-	log.Infof("HTTPS listening on %s", s.Addr)
-	var err error
-	if InsecureForTesting {
-		err = srv.ListenAndServe()
-	} else {
-		err = srv.ListenAndServeTLS(s.CertFile, s.KeyFile)
+	log.Printf("Starting gateway.ListenAndServe")
+	log.Fatalf("HTTPS exiting: %s", gateway.ListenAndServe(s.Addr, nil))
+}
+
+func (s *Server) Ping(w http.ResponseWriter, req *http.Request) {
+	// Health check target.
+	requestContext, ok := gateway.RequestContext(req.Context())
+	if !ok || requestContext.Authorizer["sub"] == nil {
+		fmt.Fprintf(w, "Hello World from DNS Over HTTP Lambda %t, %s", ok, requestContext.ResourcePath)
+		return
 	}
-	log.Fatalf("HTTPS exiting: %s", err)
 }
 
 // Resolve implements the HTTP handler for incoming DNS resolution requests.
 // It handles "Google's DNS over HTTPS using JSON" requests, as well as "DoH"
 // request.
 func (s *Server) Resolve(w http.ResponseWriter, req *http.Request) {
-	tr := trace.New("httpserver", "/resolve")
-	defer tr.Finish()
-	tr.LazyPrintf("from:%v", req.RemoteAddr)
-	tr.LazyPrintf("method:%v", req.Method)
-
 	req.ParseForm()
 
 	// Identify DoH requests:
 	//  - GET requests have a "dns=" query parameter.
 	//  - POST requests have a content-type = application/dns-message.
 	if req.Method == "GET" && req.FormValue("dns") != "" {
-		tr.LazyPrintf("DoH:GET")
+		log.Printf("GET with dns wire received")
 		dnsQuery, err := base64.RawURLEncoding.DecodeString(
 			req.FormValue("dns"))
 		if err != nil {
-			util.TraceError(tr, err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		s.resolveDoH(tr, w, dnsQuery)
+		defer timeTrack(time.Now(), "timeTrack:resolveDOH DNS lookup")
+		s.resolveDoH(w, dnsQuery)
 		return
 	}
 
 	if req.Method == "POST" {
 		ct, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
 		if err != nil {
-			util.TraceError(tr, err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		if ct == "application/dns-message" {
-			tr.LazyPrintf("DoH:POST")
+			log.Printf("POST with dns wire received")
+
 			// Limit the size of request to 4k.
 			dnsQuery, err := ioutil.ReadAll(io.LimitReader(req.Body, 4092))
 			if err != nil {
-				util.TraceError(tr, err)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 
-			s.resolveDoH(tr, w, dnsQuery)
+			defer timeTrack(time.Now(), "timeTrack:resolveDOH DNS lookup")
+			s.resolveDoH(w, dnsQuery)
 			return
 		}
 	}
@@ -119,24 +112,23 @@ func (s *Server) Resolve(w http.ResponseWriter, req *http.Request) {
 	// Fall back to Google's JSON, the laxer format.
 	// It MUST have a "name" query parameter, so we use that for detection.
 	if req.Method == "GET" && req.FormValue("name") != "" {
-		tr.LazyPrintf("Google-JSON")
-		s.resolveJSON(tr, w, req)
+		log.Printf("GET with JSON format requested")
+		defer timeTrack(time.Now(), "timeTrack:resolveJSON DNS lookup")
+		s.resolveJSON(w, req)
 		return
 	}
 
 	// Could not found how to handle this request.
-	util.TraceErrorf(tr, "unknown request type")
 	http.Error(w, "unknown request type", http.StatusUnsupportedMediaType)
 }
 
 // Resolve "Google's DNS over HTTPS using JSON" requests, and returns
 // responses as specified in
 // https://developers.google.com/speed/public-dns/docs/dns-over-https#api_specification.
-func (s *Server) resolveJSON(tr trace.Trace, w http.ResponseWriter, req *http.Request) {
+func (s *Server) resolveJSON(w http.ResponseWriter, req *http.Request) {
 	// Construct the DNS request from the http query.
 	q, err := parseQuery(req.URL)
 	if err != nil {
-		util.TraceError(tr, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -167,23 +159,17 @@ func (s *Server) resolveJSON(tr trace.Trace, w http.ResponseWriter, req *http.Re
 		r.Extra = append(r.Extra, o)
 	}
 
-	util.TraceQuestion(tr, r.Question)
-
 	// Do the DNS request, get the reply.
 	fromUp, err := dns.Exchange(r, s.Upstream)
 	if err != nil {
-		err = util.TraceErrorf(tr, "dns exchange error: %v", err)
 		http.Error(w, err.Error(), http.StatusFailedDependency)
 		return
 	}
 
 	if fromUp == nil {
-		err = util.TraceErrorf(tr, "no response from upstream")
 		http.Error(w, err.Error(), http.StatusRequestTimeout)
 		return
 	}
-
-	util.TraceAnswer(tr, fromUp)
 
 	// Convert the reply to json, and write it back.
 	jr := &dnsjson.Response{
@@ -218,7 +204,6 @@ func (s *Server) resolveJSON(tr trace.Trace, w http.ResponseWriter, req *http.Re
 
 	buf, err := json.Marshal(jr)
 	if err != nil {
-		err = util.TraceErrorf(tr, "failed to marshal: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -329,37 +314,35 @@ func stringToBool(s string) (bool, error) {
 
 // Resolve DNS over HTTPS requests, as specified in
 // https://tools.ietf.org/html/draft-ietf-doh-dns-over-https-12.
-func (s *Server) resolveDoH(tr trace.Trace, w http.ResponseWriter, dnsQuery []byte) {
+func (s *Server) resolveDoH(w http.ResponseWriter, dnsQuery []byte) {
 	r := &dns.Msg{}
 	err := r.Unpack(dnsQuery)
 	if err != nil {
-		util.TraceError(tr, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Fatalf("Error unpakcing dnsQuery %v", err.Error())
 		return
 	}
 
-	util.TraceQuestion(tr, r.Question)
-
 	// Do the DNS request, get the reply.
+	// TODO: Emit timing data on upstream resolver.
 	fromUp, err := dns.Exchange(r, s.Upstream)
+
 	if err != nil {
-		err = util.TraceErrorf(tr, "dns exchange error: %v", err)
 		http.Error(w, err.Error(), http.StatusFailedDependency)
+		log.Fatalf("DNS request failed  %v", err.Error())
 		return
 	}
 
 	if fromUp == nil {
-		err = util.TraceErrorf(tr, "no response from upstream")
-		http.Error(w, err.Error(), http.StatusRequestTimeout)
+		http.Error(w, "no response from upstream", http.StatusRequestTimeout)
+		log.Fatalf("No response from upstream  %v", err.Error())
 		return
 	}
 
-	util.TraceAnswer(tr, fromUp)
-
 	packed, err := fromUp.Pack()
 	if err != nil {
-		err = util.TraceErrorf(tr, "cannot pack reply: %v", err)
-		http.Error(w, err.Error(), http.StatusFailedDependency)
+		http.Error(w, "cannot pack reply", http.StatusFailedDependency)
+		log.Fatalf("cannot pack reply  %v", err.Error())
 		return
 	}
 

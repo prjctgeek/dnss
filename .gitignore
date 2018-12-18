@@ -3,6 +3,7 @@
 
 # Ignore the resulting binary.
 dnss
+build/*
 
 # Help prevent accidental inclusion of certificates and keys.
 *.pem

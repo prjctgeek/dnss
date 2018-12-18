@@ -11,19 +11,18 @@ import (
 	"sync"
 	"testing"
 
-	"blitiri.com.ar/go/dnss/internal/dnsserver"
-	"blitiri.com.ar/go/dnss/internal/httpresolver"
-	"blitiri.com.ar/go/dnss/internal/httpserver"
-	"blitiri.com.ar/go/dnss/internal/testutil"
-	"blitiri.com.ar/go/log"
+	"github.com/prjctgeek/dnss/internal/dnsserver"
+	"github.com/prjctgeek/dnss/internal/httpresolver"
+	"github.com/prjctgeek/dnss/internal/httpserver"
+	"github.com/prjctgeek/dnss/internal/testutil"
+	"github.com/prjctgeek/log"
+
 	"github.com/miekg/dns"
 )
 
 // Custom test main, so we reduce the default logging to avoid overly verbose
 // tests.
 func TestMain(m *testing.M) {
-	flag.Parse()
-	log.Init()
 	log.Default.Level = log.Error
 
 	os.Exit(m.Run())
@@ -211,27 +210,27 @@ func TestProxyServerDomain(t *testing.T) {
 
 	// Valid case, proxy set.
 	os.Setenv("HTTPS_PROXY", "http://proxy:1234/p")
-	*httpsUpstream = "https://montoto/xyz"
+	httpsUpstream = "https://montoto/xyz"
 	if got := proxyServerDomain(); got != "proxy" {
 		t.Errorf("got %q, expected 'proxy'", got)
 	}
 
 	// Valid case, proxy not set.
 	os.Unsetenv("HTTPS_PROXY")
-	*httpsUpstream = "https://montoto/xyz"
+	httpsUpstream = "https://montoto/xyz"
 	if got := proxyServerDomain(); got != "" {
 		t.Errorf("got %q, expected ''", got)
 	}
 
 	// Invalid upstream URL.
-	*httpsUpstream = "in%20valid:url"
+	httpsUpstream = "in%20valid:url"
 	if got := proxyServerDomain(); got != "" {
 		t.Errorf("got %q, expected ''", got)
 	}
 
 	// Invalid proxy.
 	os.Setenv("HTTPS_PROXY", "invalid value")
-	*httpsUpstream = "https://montoto/xyz"
+	httpsUpstream = "https://montoto/xyz"
 	if got := proxyServerDomain(); got != "" {
 		t.Errorf("got %q, expected ''", got)
 	}

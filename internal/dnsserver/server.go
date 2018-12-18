@@ -14,8 +14,8 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/trace"
 
-	"blitiri.com.ar/go/dnss/internal/util"
-	"blitiri.com.ar/go/log"
+	"github.com/prjctgeek/dnss/internal/util"
+	"github.com/prjctgeek/log"
 )
 
 // newID is a channel used to generate new request IDs.

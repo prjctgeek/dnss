@@ -16,154 +16,158 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 
-	"golang.org/x/net/http/httpproxy"
+	"github.com/prjctgeek/dnss/internal/dnsserver"
+	"github.com/prjctgeek/dnss/internal/httpresolver"
+	"github.com/prjctgeek/dnss/internal/httpserver"
+	"github.com/prjctgeek/dnss/internal/lambda"
+	"github.com/prjctgeek/log"
 
-	"blitiri.com.ar/go/dnss/internal/dnsserver"
-	"blitiri.com.ar/go/dnss/internal/httpresolver"
-	"blitiri.com.ar/go/dnss/internal/httpserver"
-	"blitiri.com.ar/go/log"
+	"golang.org/x/net/http/httpproxy"
 
 	// Register pprof handlers for monitoring and debugging.
 	_ "net/http/pprof"
 )
 
 var (
-	dnsListenAddr = flag.String("dns_listen_addr", ":53",
-		"address to listen on for DNS")
+	dnsListenAddr          string
+	dnsUnqualifiedUpstream string
+	fallbackUpstream       string
+	fallbackDomains        string
 
-	dnsUnqualifiedUpstream = flag.String("dns_unqualified_upstream", "",
-		"DNS server to forward unqualified requests to")
+	enableDNStoHTTPS  bool
+	httpsUpstream     string
+	httpsClientCAFile string
+	enableCache       bool
 
-	fallbackUpstream = flag.String("fallback_upstream", "8.8.8.8:53",
-		"DNS server to resolve domains in --fallback_domains")
-	fallbackDomains = flag.String("fallback_domains", "dns.google.com.",
-		"Domains we resolve via DNS, using --fallback_upstream"+
-			" (space-separated list)")
+	enableHTTPStoDNS bool
+	dnsUpstream      string
+	httpsCertFile    string
+	httpsKeyFile     string
+	httpsAddr        string
 
-	enableDNStoHTTPS = flag.Bool("enable_dns_to_https", false,
-		"enable DNS-to-HTTPS proxy")
-	httpsUpstream = flag.String("https_upstream",
-		"https://dns.google.com/resolve",
-		"URL of upstream DNS-to-HTTP server")
-	httpsClientCAFile = flag.String("https_client_cafile", "",
-		"CA file to use for the HTTPS client")
-	enableCache = flag.Bool("enable_cache", true, "enable the local cache")
+	monitoringListenAddr string
+	insecureForTesting   bool
+	forceMode            string
 
-	enableHTTPStoDNS = flag.Bool("enable_https_to_dns", false,
-		"enable HTTPS-to-DNS proxy")
-	dnsUpstream = flag.String("dns_upstream",
-		"8.8.8.8:53",
-		"Address of the upstream DNS server (for the HTTPS-to-DNS proxy)")
-	httpsCertFile = flag.String("https_cert", "",
-		"certificate to use for the HTTPS server")
-	httpsKeyFile = flag.String("https_key", "",
-		"key to use for the HTTPS server")
-	httpsAddr = flag.String("https_server_addr", ":443",
-		"address to listen on for HTTPS-to-DNS requests")
+	isLambda bool = false
+)
 
-	monitoringListenAddr = flag.String("monitoring_listen_addr", "",
-		"address to listen on for monitoring HTTP requests")
+func main() {
+	if os.Getenv("isLambda") == "true" {
+		isLambda = true
+	}
 
-	insecureForTesting = flag.Bool("testing__insecure_http", false,
-		"INSECURE, for testing only")
+	flag.StringVar(&dnsListenAddr, "dns_listen_addr", ":53", "address to listen on for DNS")
+	flag.StringVar(&dnsUnqualifiedUpstream, "dns_unqualified_upstream", "", "DNS server to forward unqualified requests to")
+	flag.StringVar(&fallbackUpstream, "fallback_upstream", "8.8.8.8:53", "DNS server to resolve domains in --fallback_domains")
+	flag.StringVar(&fallbackDomains, "fallback_domains", "dns.google.com.", "Domains we resolve via DNS, using --fallback_upstream"+" (space-separated list)")
 
-	forceMode = flag.String("force_mode", "",
-		"Force HTTPS resolver mode ('JSON', 'DoH', 'autodetect' (default))")
+	flag.BoolVar(&enableDNStoHTTPS, "enable_dns_to_https", false, "enable DNS-to-HTTPS proxy")
+	flag.StringVar(&httpsUpstream, "https_upstream", "https://dns.google.com/resolve", "URL of upstream DNS-to-HTTP server")
+	flag.StringVar(&httpsClientCAFile, "https_client_cafile", "", "CA file to use for the HTTPS client")
+	flag.BoolVar(&enableCache, "enable_cache", true, "enable the local cache")
+
+	flag.BoolVar(&enableHTTPStoDNS, "enable_https_to_dns", true, "enable HTTPS-to-DNS proxy (default)")
+	flag.StringVar(&dnsUpstream, "dns_upstream", "8.8.8.8:53", "Address of the upstream DNS server (for the HTTPS-to-DNS proxy)")
+	flag.StringVar(&httpsCertFile, "https_cert", "", "certificate to use for the HTTPS server")
+	flag.StringVar(&httpsKeyFile, "https_key", "", "key to use for the HTTPS server")
+
+	flag.StringVar(&httpsAddr, "https_server_addr", ":443", "address to listen on for HTTPS-to-DNS requests")
+	flag.StringVar(&monitoringListenAddr, "monitoring_listen_addr", "", "address to listen on for monitoring HTTP requests")
+	flag.BoolVar(&insecureForTesting, "testing__insecure_http", false, "INSECURE, for testing only")
+	flag.StringVar(&forceMode, "force_mode", "", "Force HTTPS resolver mode ('JSON', 'DoH', 'autodetect' (default))")
 
 	// Deprecated flags that no longer make sense; we keep them for backwards
 	// compatibility but may be removed in the future.
 	_ = flag.Duration("log_flush_every", 0, "deprecated, will be removed")
 	_ = flag.Bool("logtostderr", false, "deprecated, will be removed")
-)
 
-func main() {
 	flag.Parse()
-	log.Init()
 
-	if *monitoringListenAddr != "" {
-		launchMonitoringServer(*monitoringListenAddr)
+	if monitoringListenAddr != "" {
+		launchMonitoringServer(monitoringListenAddr)
 	}
 
-	if !(*enableDNStoHTTPS || *enableHTTPStoDNS) {
-		log.Errorf("Need to set one of the following:")
-		log.Errorf("  --enable_dns_to_https")
-		log.Errorf("  --enable_https_to_dns")
-		log.Fatalf("")
-	}
-
-	if *insecureForTesting {
+	if insecureForTesting {
 		httpserver.InsecureForTesting = true
 	}
 
 	var wg sync.WaitGroup
 
 	// DNS to HTTPS.
-	if *enableDNStoHTTPS {
-		upstream, err := url.Parse(*httpsUpstream)
+	if enableDNStoHTTPS {
+		upstream, err := url.Parse(httpsUpstream)
 		if err != nil {
 			log.Fatalf("-https_upstream is not a valid URL: %v", err)
 		}
 
 		var resolver dnsserver.Resolver
-		switch *forceMode {
+		switch forceMode {
 		case "DoH":
-			resolver = httpresolver.NewDoH(upstream, *httpsClientCAFile)
+			resolver = httpresolver.NewDoH(upstream, httpsClientCAFile)
 		case "JSON":
-			resolver = httpresolver.NewJSON(upstream, *httpsClientCAFile)
+			resolver = httpresolver.NewJSON(upstream, httpsClientCAFile)
 		case "", "autodetect":
-			resolver = httpresolver.New(upstream, *httpsClientCAFile)
+			resolver = httpresolver.New(upstream, httpsClientCAFile)
 		default:
-			log.Fatalf("-force_mode=%q is not a valid mode", *forceMode)
+			log.Fatalf("-force_mode=%q is not a valid mode", forceMode)
 		}
 
-		if *enableCache {
+		if enableCache {
 			cr := dnsserver.NewCachingResolver(resolver)
 			cr.RegisterDebugHandlers()
 			resolver = cr
 		}
-		dth := dnsserver.New(*dnsListenAddr, resolver, *dnsUnqualifiedUpstream)
+		dth := dnsserver.New(dnsListenAddr, resolver, dnsUnqualifiedUpstream)
 
 		// If we're using an HTTP proxy, add the name to the fallback domain
 		// so we don't have problems resolving it.
-		fallbackDoms := strings.Split(*fallbackDomains, " ")
+		fallbackDoms := strings.Split(fallbackDomains, " ")
 		if proxyDomain := proxyServerDomain(); proxyDomain != "" {
 			log.Infof("Adding proxy %q to fallback domains", proxyDomain)
 			fallbackDoms = append(fallbackDoms, proxyDomain)
 		}
 
-		dth.SetFallback(*fallbackUpstream, fallbackDoms)
+		dth.SetFallback(fallbackUpstream, fallbackDoms)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			dth.ListenAndServe()
 		}()
-	}
-
-	// HTTPS to DNS.
-	if *enableHTTPStoDNS {
-		s := httpserver.Server{
-			Addr:     *httpsAddr,
-			Upstream: *dnsUpstream,
-			CertFile: *httpsCertFile,
-			KeyFile:  *httpsKeyFile,
+	} else {
+		// HTTPS to DNS.
+		if isLambda {
+			log.Infof("going the Lambda handler route")
+			l := lambda.Server{
+				Addr:     httpsAddr,
+				Upstream: dnsUpstream,
+			}
+			l.ListenAndServe()
+		} else {
+			s := httpserver.Server{
+				Addr:     httpsAddr,
+				Upstream: dnsUpstream,
+				CertFile: httpsCertFile,
+				KeyFile:  httpsKeyFile,
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.ListenAndServe()
+			}()
+			wg.Wait()
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.ListenAndServe()
-		}()
 	}
-
-	wg.Wait()
 }
 
 // proxyServerDomain checks if we're using an HTTP proxy server, and if so
 // returns its domain.
 func proxyServerDomain() string {
-	url, err := url.Parse(*httpsUpstream)
+	url, err := url.Parse(httpsUpstream)
 	if err != nil {
 		return ""
 	}

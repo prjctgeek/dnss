@@ -13,9 +13,9 @@ import (
 	"net/url"
 	"time"
 
-	"blitiri.com.ar/go/dnss/internal/dnsjson"
-	"blitiri.com.ar/go/dnss/internal/dnsserver"
-	"blitiri.com.ar/go/log"
+	"github.com/prjctgeek/dnss/internal/dnsjson"
+	"github.com/prjctgeek/dnss/internal/dnsserver"
+	"github.com/prjctgeek/log"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/trace"
